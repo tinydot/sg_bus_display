@@ -293,33 +293,22 @@ static void formatMin(int m, char* buf, size_t n) {
 }
 
 // Build the static UI for Stop A (the large top block).
-// Up to 3 rows fit at the doubled font size within ~225 px of height.
+// No stop-info header and no column headers — just stacked rows of
+// bus badges with their Next/After minute columns. Up to 4 rows fit
+// within ~225 px of height at 56 px row pitch.
 static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
                            int y_offset, const char* /*labelText*/) {
   lv_obj_t* parent = lv_scr_act();
+  (void)cfg;
 
-  // Header label, top-left of this block
-  ui.header = lv_label_create(parent);
-  lv_obj_add_style(ui.header, &style_header, 0);
-  lv_obj_set_pos(ui.header, 6, y_offset + 4);
-  lv_label_set_text(ui.header, cfg.label);
+  // The header field is kept on the struct for ABI stability but
+  // intentionally unused at this layout size.
+  ui.header = nullptr;
 
-  // Right-aligned column headers above the minute columns
-  lv_obj_t* h_next = lv_label_create(parent);
-  lv_obj_t* h_aft  = lv_label_create(parent);
-  lv_obj_add_style(h_next, &style_small, 0);
-  lv_obj_add_style(h_aft,  &style_small, 0);
-  lv_obj_set_pos(h_next, 200, y_offset + 12);
-  lv_obj_set_pos(h_aft,  320, y_offset + 12);
-  lv_label_set_text(h_next, "Next");
-  lv_label_set_text(h_aft,  "After");
-
-  // Up to 4 rows per stop (only 3 are visible at this size; the 4th is
-  // allocated for renderStop()'s bounds but starts hidden). Each row:
-  // black badge with bus number, then "next" and "after" minutes
-  // right-aligned in their columns.
+  // Up to 4 rows per stop. Each row: black badge with bus number,
+  // then "next" and "after" minutes right-aligned in their columns.
   for (int i = 0; i < 4; i++) {
-    int ry = y_offset + 50 + i * 56;
+    int ry = y_offset + 4 + i * 56;
 
     // Badge: black-filled rectangle behind the bus number
     ui.badge[i] = lv_obj_create(parent);
@@ -357,29 +346,25 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
   }
 }
 
-// Compact horizontal layout for the bottom (25%) block. At doubled
-// font size only ~75 px of vertical space is available, so the header,
-// badge, and minute values share a single line. Only one bus row is
-// shown (row 0); the remaining slots are created but stay hidden so
-// renderStop()'s loop bounds stay valid.
+// Compact horizontal layout for the bottom (25 %) block. At doubled
+// font size only ~48 px of vertical space is available, so the badge
+// and minute values share a single line. No stop-info header. Only
+// one bus row is shown (row 0); the remaining slots are created but
+// stay hidden so renderStop()'s loop bounds stay valid.
 static void buildStopBlockCompact(StopUi& ui, const StopConfig& cfg,
                                   int y_offset) {
   lv_obj_t* parent = lv_scr_act();
+  (void)cfg;
 
-  // Small header on the left, vertically centred with the badge.
-  ui.header = lv_label_create(parent);
-  lv_obj_add_style(ui.header, &style_small, 0);
-  lv_obj_set_pos(ui.header, 6, y_offset + 10);
-  lv_label_set_text(ui.header, cfg.label);
-
+  ui.header = nullptr;
   int ry = y_offset + 2;
 
   // Row 0: badge, next, after — all on one line
   ui.badge[0] = lv_obj_create(parent);
   lv_obj_remove_style_all(ui.badge[0]);
   lv_obj_add_style(ui.badge[0], &style_badge, 0);
-  lv_obj_set_size(ui.badge[0], 110, 44);
-  lv_obj_set_pos(ui.badge[0], 130, ry);
+  lv_obj_set_size(ui.badge[0], 130, 44);
+  lv_obj_set_pos(ui.badge[0], 6, ry);
 
   ui.svc_label[0] = lv_label_create(ui.badge[0]);
   lv_obj_add_style(ui.svc_label[0], &style_badge_text, 0);
@@ -390,12 +375,12 @@ static void buildStopBlockCompact(StopUi& ui, const StopConfig& cfg,
   ui.after_label[0] = lv_label_create(parent);
   lv_obj_add_style(ui.next_label[0],  &style_row, 0);
   lv_obj_add_style(ui.after_label[0], &style_row, 0);
-  lv_obj_set_width(ui.next_label[0],  70);
-  lv_obj_set_width(ui.after_label[0], 70);
+  lv_obj_set_width(ui.next_label[0],  100);
+  lv_obj_set_width(ui.after_label[0], 110);
   lv_obj_set_style_text_align(ui.next_label[0],  LV_TEXT_ALIGN_RIGHT, 0);
   lv_obj_set_style_text_align(ui.after_label[0], LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(ui.next_label[0],  250, ry + 6);
-  lv_obj_set_pos(ui.after_label[0], 325, ry + 6);
+  lv_obj_set_pos(ui.next_label[0],  160, ry + 6);
+  lv_obj_set_pos(ui.after_label[0], 285, ry + 6);
   lv_label_set_text(ui.next_label[0],  "");
   lv_label_set_text(ui.after_label[0], "");
   lv_obj_add_flag(ui.badge[0], LV_OBJ_FLAG_HIDDEN);
@@ -441,8 +426,10 @@ static void buildUi() {
   lv_style_set_text_font(&style_row, &lv_font_montserrat_32);
   lv_style_set_text_color(&style_row, lv_color_black());
 
+  // style_small is only used by the footer (updated time) and the
+  // status bar (boot/error messages). Halved from the previous _24.
   lv_style_init(&style_small);
-  lv_style_set_text_font(&style_small, &lv_font_montserrat_24);
+  lv_style_set_text_font(&style_small, &lv_font_montserrat_12);
   lv_style_set_text_color(&style_small, lv_color_black());
 
   // Bus-number badge: black-filled rounded rectangle.
@@ -475,13 +462,13 @@ static void buildUi() {
   // Footer (bottom-right, updated time) sits below Stop B's row.
   ui_footer = lv_label_create(scr);
   lv_obj_add_style(ui_footer, &style_small, 0);
-  lv_obj_set_pos(ui_footer, 220, 274);
+  lv_obj_set_pos(ui_footer, 320, 286);
   lv_label_set_text(ui_footer, "");
 
   // Status bar (only used for boot/error messages)
   ui_status = lv_label_create(scr);
   lv_obj_add_style(ui_status, &style_small, 0);
-  lv_obj_set_pos(ui_status, 6, 274);
+  lv_obj_set_pos(ui_status, 6, 286);
   lv_label_set_text(ui_status, "Booting...");
 }
 
