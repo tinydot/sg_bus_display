@@ -312,15 +312,15 @@ static void buildUi() {
   lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  // Reusable styles. Montserrat 22 and 20 are enabled in
-  // src/ui_src/custom/lv_conf_ext.h. If they're missing from your
-  // LVGL build, add them there or directly in lv_conf.h.
+  // Reusable styles. To get Montserrat 22, find lv_conf.h in your
+  // LVGL Arduino library (e.g. ~/Documents/Arduino/libraries/lvgl/lv_conf.h),
+  // set LV_FONT_MONTSERRAT_22 to 1, then change _16 → _22 below.
   lv_style_init(&style_header);
   lv_style_set_text_font(&style_header, &lv_font_montserrat_16);
   lv_style_set_text_color(&style_header, lv_color_black());
 
   lv_style_init(&style_row);
-  lv_style_set_text_font(&style_row, &lv_font_montserrat_22);
+  lv_style_set_text_font(&style_row, &lv_font_montserrat_16);  // bump to _22 after enabling it in lv_conf.h
   lv_style_set_text_color(&style_row, lv_color_black());
 
   lv_style_init(&style_small);
