@@ -531,12 +531,17 @@ void loop() {
     arrivals_initialized = true;
   }
 
+  // Stagger the two LTA calls by REFRESH_MS instead of firing them
+  // back-to-back. Each stop is polled once per (2 * REFRESH_MS) but
+  // the UI still repaints every REFRESH_MS — between fetches the
+  // cached ISO timestamps keep counting down.
+  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   fetchStop(STOP_A, a);
+  renderAll(a, b);
+  vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
+
+  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   fetchStop(STOP_B, b);
   renderAll(a, b);
-
-  // Sleep until next refresh. LVGL runs in its own task on Waveshare's
-  // BSP so we don't need to call lv_timer_handler() ourselves.
-  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
 }
