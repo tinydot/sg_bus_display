@@ -267,16 +267,16 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
   lv_obj_set_pos(ui.header, 8, y_offset + 2);
   lv_label_set_text(ui.header, cfg.label);
 
-  // Column headers
+  // Column headers — tighter layout for larger row font
   lv_obj_t* h_bus  = lv_label_create(parent);
   lv_obj_t* h_next = lv_label_create(parent);
   lv_obj_t* h_aft  = lv_label_create(parent);
   lv_obj_add_style(h_bus,  &style_small, 0);
   lv_obj_add_style(h_next, &style_small, 0);
   lv_obj_add_style(h_aft,  &style_small, 0);
-  lv_obj_set_pos(h_bus,   8,  y_offset + 32);
-  lv_obj_set_pos(h_next, 180, y_offset + 32);
-  lv_obj_set_pos(h_aft,  300, y_offset + 32);
+  lv_obj_set_pos(h_bus,   8,  y_offset + 20);
+  lv_obj_set_pos(h_next,  80, y_offset + 20);
+  lv_obj_set_pos(h_aft,  210, y_offset + 20);
   lv_label_set_text(h_bus,  "Bus");
   lv_label_set_text(h_next, "Next");
   lv_label_set_text(h_aft,  "After");
@@ -284,7 +284,7 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
   // Up to 4 rows per stop. Pre-create all 4 and hide unused ones by
   // leaving them empty.
   for (int i = 0; i < 4; i++) {
-    int ry = y_offset + 52 + i * 20;
+    int ry = y_offset + 36 + i * 28;
 
     ui.svc_label[i]   = lv_label_create(parent);
     ui.next_label[i]  = lv_label_create(parent);
@@ -294,9 +294,9 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
     lv_obj_add_style(ui.next_label[i],  &style_row, 0);
     lv_obj_add_style(ui.after_label[i], &style_row, 0);
 
-    lv_obj_set_pos(ui.svc_label[i],     8, ry);
-    lv_obj_set_pos(ui.next_label[i],  180, ry);
-    lv_obj_set_pos(ui.after_label[i], 300, ry);
+    lv_obj_set_pos(ui.svc_label[i],    8, ry);
+    lv_obj_set_pos(ui.next_label[i],  80, ry);
+    lv_obj_set_pos(ui.after_label[i], 210, ry);
 
     lv_label_set_text(ui.svc_label[i],   "");
     lv_label_set_text(ui.next_label[i],  "");
@@ -312,15 +312,15 @@ static void buildUi() {
   lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-  // Reusable styles. Stick to the Montserrat sizes the example's
-  // lv_conf.h enables (12, 14, 16). If you want larger fonts, edit
-  // lv_conf.h to set LV_FONT_MONTSERRAT_20 / _22 to 1.
+  // Reusable styles. Montserrat 22 and 20 are enabled in
+  // src/ui_src/custom/lv_conf_ext.h. If they're missing from your
+  // LVGL build, add them there or directly in lv_conf.h.
   lv_style_init(&style_header);
   lv_style_set_text_font(&style_header, &lv_font_montserrat_16);
   lv_style_set_text_color(&style_header, lv_color_black());
 
   lv_style_init(&style_row);
-  lv_style_set_text_font(&style_row, &lv_font_montserrat_16);
+  lv_style_set_text_font(&style_row, &lv_font_montserrat_22);
   lv_style_set_text_color(&style_row, lv_color_black());
 
   lv_style_init(&style_small);
