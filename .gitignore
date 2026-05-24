@@ -1,0 +1,11 @@
+secrets.h
+*.hex
+*.elf
+*.bin
+*.eep
+*.map
+*.log
+*.tmp
+*.obj
+.DS_Store
+.vscode/
