@@ -46,10 +46,15 @@ struct StopConfig {
 
 struct ServiceArrival {
   char service[6];   // e.g. "801"
-  int  mins1;        // -1 = no data, 0 = "Arr"
-  int  mins2;        // -1 = no data
+  char iso1[32];     // last-known NextBus  ISO arrival, "" if never seen
+  char iso2[32];     // last-known NextBus2 ISO arrival, "" if never seen
 };
 
+// Persisted across loop iterations. rows[] is populated once from
+// StopConfig.services and never resized; fetchStop() only overwrites
+// iso1/iso2 when the LTA response carries a non-empty value, so a
+// missing service in one response keeps counting down from the last
+// good fetch instead of flashing "--".
 struct StopArrivals {
   ServiceArrival rows[6];
   int  count;
@@ -164,12 +169,32 @@ static int minutesUntil(const char* iso) {
   if (now_utc < 1700000000) return -1; // clock not yet synced
 
   long diff = (long)(arr - now_utc);
+  // A cached timestamp more than a minute in the past is stale — the
+  // bus has long since left and LTA just hasn't given us a fresh value.
+  // Treat it as no-data so the UI shows "--" rather than a stuck "Arr".
+  if (diff < -60) return -1;
   if (diff < 0) diff = 0;
   return (int)((diff + 30) / 60);
 }
 
-static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
+static void initStopArrivals(StopArrivals& out, const StopConfig& cfg) {
   out.count = 0;
+  out.ok = false;
+  out.error[0] = '\0';
+  for (int i = 0; cfg.services[i] != nullptr
+                  && out.count < (int)(sizeof(out.rows) / sizeof(out.rows[0])); i++) {
+    ServiceArrival& r = out.rows[out.count++];
+    strncpy(r.service, cfg.services[i], sizeof(r.service) - 1);
+    r.service[sizeof(r.service) - 1] = '\0';
+    r.iso1[0] = '\0';
+    r.iso2[0] = '\0';
+  }
+}
+
+static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
+  // Note: out.rows / out.count are preserved across calls so cached
+  // ISO timestamps survive a failed or partial fetch. We only clear
+  // the ok/error flags here.
   out.ok = false;
   out.error[0] = '\0';
 
@@ -223,28 +248,36 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   }
 
   JsonArray services = doc["Services"].as<JsonArray>();
-  Serial.printf("[%s] Services in filtered doc: %d\n", cfg.code, (int)services.size());
+  Serial.printf("[%s] Services in response: %d\n", cfg.code, (int)services.size());
   for (JsonObject s : services) {
-    if (out.count >= (int)(sizeof(out.rows) / sizeof(out.rows[0]))) break;
     const char* sn = s["ServiceNo"] | "";
     if (!*sn) continue;
 
-    // Only keep services we care about for this stop.
-    bool wanted = false;
-    for (int i = 0; cfg.services[i] != nullptr; i++) {
-      if (strcmp(cfg.services[i], sn) == 0) { wanted = true; break; }
+    // Find the matching cached row for this configured service.
+    ServiceArrival* row = nullptr;
+    for (int i = 0; i < out.count; i++) {
+      if (strcmp(out.rows[i].service, sn) == 0) { row = &out.rows[i]; break; }
     }
-    if (!wanted) continue;
+    if (!row) continue;
 
-    ServiceArrival& row = out.rows[out.count++];
-    strncpy(row.service, sn, sizeof(row.service) - 1);
-    row.service[sizeof(row.service) - 1] = '\0';
     const char* iso1 = s["NextBus"]["EstimatedArrival"]  | "";
     const char* iso2 = s["NextBus2"]["EstimatedArrival"] | "";
-    row.mins1 = minutesUntil(iso1);
-    row.mins2 = minutesUntil(iso2);
-    Serial.printf("  %s: iso1='%s' -> %d min, iso2='%s' -> %d min\n",
-                  sn, iso1, row.mins1, iso2, row.mins2);
+
+    // Only overwrite the cache when LTA gave us a real timestamp.
+    // An empty string means "no info this poll" — keep the previous
+    // value so the displayed minutes keep decrementing.
+    if (*iso1) {
+      strncpy(row->iso1, iso1, sizeof(row->iso1) - 1);
+      row->iso1[sizeof(row->iso1) - 1] = '\0';
+    }
+    if (*iso2) {
+      strncpy(row->iso2, iso2, sizeof(row->iso2) - 1);
+      row->iso2[sizeof(row->iso2) - 1] = '\0';
+    }
+    Serial.printf("  %s: iso1='%s'%s -> %d min, iso2='%s'%s -> %d min\n",
+                  sn,
+                  row->iso1, *iso1 ? "" : " (cached)", minutesUntil(row->iso1),
+                  row->iso2, *iso2 ? "" : " (cached)", minutesUntil(row->iso2));
   }
 
   out.ok = true;
@@ -386,28 +419,20 @@ static void buildUi() {
 
 // ---------------- UI update ----------------
 
-static void renderStop(StopUi& ui, const StopConfig& cfg, const StopArrivals& arr) {
-  // Walk configured services in declared order; show "--" when LTA
-  // returned no data for one.
+static void renderStop(StopUi& ui, const StopConfig& /*cfg*/, const StopArrivals& arr) {
+  // Walk cached rows (populated once from StopConfig.services).
+  // Minutes are recomputed from the cached ISO string on every render
+  // so a row keeps counting down between successful fetches.
   int row = 0;
-  for (int i = 0; cfg.services[i] != nullptr && row < 4; i++) {
-    const char* svc = cfg.services[i];
-    int m1 = -1, m2 = -1;
-    if (arr.ok) {
-      for (int j = 0; j < arr.count; j++) {
-        if (strcmp(arr.rows[j].service, svc) == 0) {
-          m1 = arr.rows[j].mins1;
-          m2 = arr.rows[j].mins2;
-          break;
-        }
-      }
-    }
+  for (int i = 0; i < arr.count && row < 4; i++) {
+    int m1 = minutesUntil(arr.rows[i].iso1);
+    int m2 = minutesUntil(arr.rows[i].iso2);
 
     char b1[8], b2[8];
     formatMin(m1, b1, sizeof(b1));
     formatMin(m2, b2, sizeof(b2));
 
-    lv_label_set_text(ui.svc_label[row],   svc);
+    lv_label_set_text(ui.svc_label[row],   arr.rows[i].service);
     lv_label_set_text(ui.next_label[row],  b1);
     lv_label_set_text(ui.after_label[row], b2);
     lv_obj_clear_flag(ui.badge[row], LV_OBJ_FLAG_HIDDEN);
@@ -496,13 +521,27 @@ void setup() {
 }
 
 void loop() {
-  StopArrivals a{}, b{};
+  // Persist arrival caches across iterations so a missing entry in one
+  // poll falls back to the previous ISO timestamp instead of "--".
+  static StopArrivals a, b;
+  static bool arrivals_initialized = false;
+  if (!arrivals_initialized) {
+    initStopArrivals(a, STOP_A);
+    initStopArrivals(b, STOP_B);
+    arrivals_initialized = true;
+  }
+
+  // Stagger the two LTA calls by REFRESH_MS instead of firing them
+  // back-to-back. Each stop is polled once per (2 * REFRESH_MS) but
+  // the UI still repaints every REFRESH_MS — between fetches the
+  // cached ISO timestamps keep counting down.
+  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   fetchStop(STOP_A, a);
+  renderAll(a, b);
+  vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
+
+  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   fetchStop(STOP_B, b);
   renderAll(a, b);
-
-  // Sleep until next refresh. LVGL runs in its own task on Waveshare's
-  // BSP so we don't need to call lv_timer_handler() ourselves.
-  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
 }
