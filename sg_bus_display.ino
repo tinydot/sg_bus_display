@@ -59,7 +59,8 @@ struct StopArrivals {
 
 struct StopUi {
   lv_obj_t* header;
-  lv_obj_t* svc_label[4];    // bus number column
+  lv_obj_t* badge[4];        // black-filled rectangle behind bus number
+  lv_obj_t* svc_label[4];    // bus number (white-on-black)
   lv_obj_t* next_label[4];   // "next" minutes column
   lv_obj_t* after_label[4];  // "after" minutes column
 };
@@ -110,6 +111,8 @@ static lv_obj_t* ui_status; // shown only when something is wrong
 static lv_style_t style_header;
 static lv_style_t style_row;
 static lv_style_t style_small;
+static lv_style_t style_badge;
+static lv_style_t style_badge_text;
 
 // ---------------- LTA fetch ----------------
 
@@ -264,43 +267,57 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
   // Header label, top-left of this half
   ui.header = lv_label_create(parent);
   lv_obj_add_style(ui.header, &style_header, 0);
-  lv_obj_set_pos(ui.header, 8, y_offset + 2);
+  lv_obj_set_pos(ui.header, 6, y_offset + 2);
   lv_label_set_text(ui.header, cfg.label);
 
-  // Column headers — tighter layout for larger row font
-  lv_obj_t* h_bus  = lv_label_create(parent);
+  // Right-aligned column headers above the minute columns
   lv_obj_t* h_next = lv_label_create(parent);
   lv_obj_t* h_aft  = lv_label_create(parent);
-  lv_obj_add_style(h_bus,  &style_small, 0);
   lv_obj_add_style(h_next, &style_small, 0);
   lv_obj_add_style(h_aft,  &style_small, 0);
-  lv_obj_set_pos(h_bus,   8,  y_offset + 20);
-  lv_obj_set_pos(h_next,  80, y_offset + 20);
-  lv_obj_set_pos(h_aft,  210, y_offset + 20);
-  lv_label_set_text(h_bus,  "Bus");
+  lv_obj_set_pos(h_next, 175, y_offset + 6);
+  lv_obj_set_pos(h_aft,  295, y_offset + 6);
   lv_label_set_text(h_next, "Next");
   lv_label_set_text(h_aft,  "After");
 
-  // Up to 4 rows per stop. Pre-create all 4 and hide unused ones by
-  // leaving them empty.
+  // Up to 4 rows per stop. Each row: black badge with bus number,
+  // then "next" and "after" minutes right-aligned in their columns.
   for (int i = 0; i < 4; i++) {
-    int ry = y_offset + 36 + i * 28;
+    int ry = y_offset + 28 + i * 29;
 
-    ui.svc_label[i]   = lv_label_create(parent);
+    // Badge: black-filled rectangle behind the bus number
+    ui.badge[i] = lv_obj_create(parent);
+    lv_obj_remove_style_all(ui.badge[i]);
+    lv_obj_add_style(ui.badge[i], &style_badge, 0);
+    lv_obj_set_size(ui.badge[i], 80, 24);
+    lv_obj_set_pos(ui.badge[i], 6, ry);
+
+    ui.svc_label[i] = lv_label_create(ui.badge[i]);
+    lv_obj_add_style(ui.svc_label[i], &style_badge_text, 0);
+    lv_obj_center(ui.svc_label[i]);
+    lv_label_set_text(ui.svc_label[i], "");
+
+    // Minutes columns — right-aligned so a 2-digit number lines up
+    // with a 1-digit number above it.
     ui.next_label[i]  = lv_label_create(parent);
     ui.after_label[i] = lv_label_create(parent);
 
-    lv_obj_add_style(ui.svc_label[i],   &style_row, 0);
     lv_obj_add_style(ui.next_label[i],  &style_row, 0);
     lv_obj_add_style(ui.after_label[i], &style_row, 0);
 
-    lv_obj_set_pos(ui.svc_label[i],    8, ry);
-    lv_obj_set_pos(ui.next_label[i],  80, ry);
-    lv_obj_set_pos(ui.after_label[i], 210, ry);
+    lv_obj_set_width(ui.next_label[i],  90);
+    lv_obj_set_width(ui.after_label[i], 90);
+    lv_obj_set_style_text_align(ui.next_label[i],  LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_align(ui.after_label[i], LV_TEXT_ALIGN_RIGHT, 0);
 
-    lv_label_set_text(ui.svc_label[i],   "");
+    lv_obj_set_pos(ui.next_label[i],  110, ry + 3);
+    lv_obj_set_pos(ui.after_label[i], 230, ry + 3);
+
     lv_label_set_text(ui.next_label[i],  "");
     lv_label_set_text(ui.after_label[i], "");
+
+    // Hidden until renderStop fills in real data
+    lv_obj_add_flag(ui.badge[i], LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -326,6 +343,19 @@ static void buildUi() {
   lv_style_init(&style_small);
   lv_style_set_text_font(&style_small, &lv_font_montserrat_12);
   lv_style_set_text_color(&style_small, lv_color_black());
+
+  // Bus-number badge: black-filled rounded rectangle.
+  lv_style_init(&style_badge);
+  lv_style_set_bg_color(&style_badge, lv_color_black());
+  lv_style_set_bg_opa(&style_badge, LV_OPA_COVER);
+  lv_style_set_radius(&style_badge, 3);
+  lv_style_set_border_width(&style_badge, 0);
+  lv_style_set_pad_all(&style_badge, 0);
+
+  // White text on the black badge.
+  lv_style_init(&style_badge_text);
+  lv_style_set_text_font(&style_badge_text, &lv_font_montserrat_16);
+  lv_style_set_text_color(&style_badge_text, lv_color_white());
 
   // Stop A occupies y = 0..148, Stop B occupies y = 150..298.
   buildStopBlock(ui_a, STOP_A,   0, STOP_A.label);
@@ -380,13 +410,15 @@ static void renderStop(StopUi& ui, const StopConfig& cfg, const StopArrivals& ar
     lv_label_set_text(ui.svc_label[row],   svc);
     lv_label_set_text(ui.next_label[row],  b1);
     lv_label_set_text(ui.after_label[row], b2);
+    lv_obj_clear_flag(ui.badge[row], LV_OBJ_FLAG_HIDDEN);
     row++;
   }
-  // Clear any leftover rows from a previous render
+  // Hide any leftover rows from a previous render
   for (; row < 4; row++) {
     lv_label_set_text(ui.svc_label[row],   "");
     lv_label_set_text(ui.next_label[row],  "");
     lv_label_set_text(ui.after_label[row], "");
+    lv_obj_add_flag(ui.badge[row], LV_OBJ_FLAG_HIDDEN);
   }
 }
 
