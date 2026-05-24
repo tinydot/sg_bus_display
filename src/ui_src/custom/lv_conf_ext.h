@@ -32,6 +32,11 @@
 #else
 /* code for board begin */
 
+/* Enable larger Montserrat sizes for distance-readable bus display */
+#undef  LV_FONT_MONTSERRAT_20
+#define LV_FONT_MONTSERRAT_20 1
+#undef  LV_FONT_MONTSERRAT_22
+#define LV_FONT_MONTSERRAT_22 1
 
 /* code for board end */	
 #endif
