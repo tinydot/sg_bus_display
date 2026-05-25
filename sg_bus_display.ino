@@ -219,6 +219,9 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   int code = http.GET();
   if (code != 200) {
     snprintf(out.error, sizeof(out.error), "HTTP %d", code);
+    Serial.printf("[%s] HTTP %d (fail), rssi=%d, heap=%u\n",
+                  cfg.code, code,
+                  (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
     http.end();
     return false;
   }
@@ -232,7 +235,9 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   int firstBrace = payload.indexOf('{');
   if (firstBrace > 0) payload.remove(0, firstBrace);
 
-  Serial.printf("[%s] HTTP %d, payload len=%d\n", cfg.code, code, payload.length());
+  Serial.printf("[%s] HTTP %d, payload len=%d, rssi=%d, heap=%u\n",
+                cfg.code, code, payload.length(),
+                (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
   if (payload.length() < 200) {
     Serial.printf("[%s] payload: %s\n", cfg.code, payload.c_str());
   }
@@ -544,6 +549,18 @@ static void connectWiFi() {
   Serial.println(WiFi.status() == WL_CONNECTED ? " connected" : " FAILED");
 }
 
+// Full WiFi stack reset. Used after repeated fetch failures when
+// WiFi.status() lies about being CONNECTED (zombie association: the
+// AP dropped us, DHCP lease expired, or lwIP got stuck). A plain
+// WiFi.reconnect() is not enough in that state — we need to tear the
+// stack down and re-associate from scratch.
+static void hardResetWiFi() {
+  Serial.println("WiFi: hard reset");
+  WiFi.disconnect(true, true);   // disconnect + erase stored config
+  delay(500);
+  connectWiFi();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -590,13 +607,27 @@ void loop() {
   // back-to-back. Each stop is polled once per (2 * REFRESH_MS) but
   // the UI still repaints every REFRESH_MS — between fetches the
   // cached ISO timestamps keep counting down.
-  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-  fetchStop(STOP_A, a);
+  //
+  // After 3 consecutive failed fetches we assume WiFi.status() is
+  // lying (zombie association) and force a full stack reset. A plain
+  // WiFi.reconnect() doesn't recover from that state.
+  static int consecutive_fails = 0;
+  auto pollOne = [&](const StopConfig& cfg, StopArrivals& out) {
+    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+    bool ok = fetchStop(cfg, out);
+    if (ok) {
+      consecutive_fails = 0;
+    } else if (++consecutive_fails >= 3) {
+      hardResetWiFi();
+      consecutive_fails = 0;
+    }
+  };
+
+  pollOne(STOP_A, a);
   renderAll(a, b);
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
 
-  if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-  fetchStop(STOP_B, b);
+  pollOne(STOP_B, b);
   renderAll(a, b);
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
 }
