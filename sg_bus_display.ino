@@ -27,6 +27,7 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include "esp_pm.h"
 
 // Waveshare's RLCD + LVGL helpers (copied from their example into
 // this sketch folder under src/app_bsp/ — see README).
@@ -111,7 +112,14 @@ static void Lvgl_FlushCallback(lv_display_t* drv, const lv_area_t* area, uint8_t
 static StopUi ui_a;
 static StopUi ui_b;
 static lv_obj_t* ui_footer;
-static lv_obj_t* ui_status; // shown only when something is wrong
+static lv_obj_t* ui_status;  // shown only when something is wrong
+static lv_obj_t* ui_battery; // "NN%" battery indicator
+
+// Waveshare ESP32-S3-RLCD-4.2 routes VBAT through a 3x divider into
+// GPIO4 (ADC1 ch3). 18650 cell: 2.5 V empty -> 4.2 V full.
+static const int BAT_ADC_PIN = 4;
+static const uint32_t BAT_EMPTY_MV = 2500;
+static const uint32_t BAT_FULL_MV  = 4200;
 
 static lv_style_t style_header;
 static lv_style_t style_row;
@@ -289,6 +297,20 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   return true;
 }
 
+// ---------------- Battery ----------------
+
+static int readBatteryPercent() {
+  // Average 16 reads; analogReadMilliVolts applies the ESP32-S3's
+  // factory ADC calibration so we don't have to hand-tune.
+  const int samples = 16;
+  uint32_t sum_mv = 0;
+  for (int i = 0; i < samples; i++) sum_mv += analogReadMilliVolts(BAT_ADC_PIN);
+  uint32_t mv = (sum_mv / samples) * 3;  // undo the 3x divider
+  if (mv <= BAT_EMPTY_MV) return 0;
+  if (mv >= BAT_FULL_MV)  return 100;
+  return (int)((mv - BAT_EMPTY_MV) * 100 / (BAT_FULL_MV - BAT_EMPTY_MV));
+}
+
 // ---------------- UI build ----------------
 
 static void formatMin(int m, char* buf, size_t n) {
@@ -351,65 +373,9 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
   }
 }
 
-// Compact horizontal layout for the bottom (25 %) block. At doubled
-// font size only ~48 px of vertical space is available, so the badge
-// and minute values share a single line. No stop-info header. Only
-// one bus row is shown (row 0); the remaining slots are created but
-// stay hidden so renderStop()'s loop bounds stay valid.
 static void buildStopBlockCompact(StopUi& ui, const StopConfig& cfg,
                                   int y_offset) {
-  lv_obj_t* parent = lv_scr_act();
-  (void)cfg;
-
-  ui.header = nullptr;
-  int ry = y_offset + 2;
-
-  // Row 0: badge, next, after — all on one line
-  ui.badge[0] = lv_obj_create(parent);
-  lv_obj_remove_style_all(ui.badge[0]);
-  lv_obj_add_style(ui.badge[0], &style_badge, 0);
-  lv_obj_set_size(ui.badge[0], 130, 44);
-  lv_obj_set_pos(ui.badge[0], 6, ry);
-
-  ui.svc_label[0] = lv_label_create(ui.badge[0]);
-  lv_obj_add_style(ui.svc_label[0], &style_badge_text, 0);
-  lv_obj_center(ui.svc_label[0]);
-  lv_label_set_text(ui.svc_label[0], "");
-
-  ui.next_label[0]  = lv_label_create(parent);
-  ui.after_label[0] = lv_label_create(parent);
-  lv_obj_add_style(ui.next_label[0],  &style_row, 0);
-  lv_obj_add_style(ui.after_label[0], &style_row, 0);
-  lv_obj_set_width(ui.next_label[0],  100);
-  lv_obj_set_width(ui.after_label[0], 110);
-  lv_obj_set_style_text_align(ui.next_label[0],  LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_style_text_align(ui.after_label[0], LV_TEXT_ALIGN_RIGHT, 0);
-  lv_obj_set_pos(ui.next_label[0],  160, ry + 6);
-  lv_obj_set_pos(ui.after_label[0], 285, ry + 6);
-  lv_label_set_text(ui.next_label[0],  "");
-  lv_label_set_text(ui.after_label[0], "");
-  lv_obj_add_flag(ui.badge[0], LV_OBJ_FLAG_HIDDEN);
-
-  // Allocate the remaining slots off-screen and hidden, so renderStop's
-  // 0..3 loop has something to write to without affecting the display.
-  for (int i = 1; i < 4; i++) {
-    ui.badge[i] = lv_obj_create(parent);
-    lv_obj_remove_style_all(ui.badge[i]);
-    lv_obj_add_style(ui.badge[i], &style_badge, 0);
-    lv_obj_set_size(ui.badge[i], 1, 1);
-    lv_obj_set_pos(ui.badge[i], -10, -10);
-    ui.svc_label[i]   = lv_label_create(ui.badge[i]);
-    ui.next_label[i]  = lv_label_create(parent);
-    ui.after_label[i] = lv_label_create(parent);
-    lv_obj_set_pos(ui.next_label[i],  -10, -10);
-    lv_obj_set_pos(ui.after_label[i], -10, -10);
-    lv_label_set_text(ui.svc_label[i],   "");
-    lv_label_set_text(ui.next_label[i],  "");
-    lv_label_set_text(ui.after_label[i], "");
-    lv_obj_add_flag(ui.badge[i], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ui.next_label[i],  LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ui.after_label[i], LV_OBJ_FLAG_HIDDEN);
-  }
+  buildStopBlock(ui, cfg, y_offset, cfg.label);
 }
 
 static void buildUi() {
@@ -452,10 +418,10 @@ static void buildUi() {
 
   // 75/25 split: Stop A occupies y = 0..223, Stop B occupies y = 225..298.
   buildStopBlock(ui_a, STOP_A, 0, STOP_A.label);
-  buildStopBlockCompact(ui_b, STOP_B, 225);
+  buildStopBlockCompact(ui_b, STOP_B, 200);
 
   // Horizontal divider between stops
-  static lv_point_precise_t divider_pts[] = { {0, 224}, {400, 224} };
+  static lv_point_precise_t divider_pts[] = { {0, 200}, {400, 200} };
   lv_obj_t* divider = lv_line_create(scr);
   lv_line_set_points(divider, divider_pts, 2);
   static lv_style_t style_line;
@@ -475,6 +441,12 @@ static void buildUi() {
   lv_obj_add_style(ui_status, &style_small, 0);
   lv_obj_set_pos(ui_status, 6, 286);
   lv_label_set_text(ui_status, "Booting...");
+
+  // Battery indicator, centered between status and footer.
+  ui_battery = lv_label_create(scr);
+  lv_obj_add_style(ui_battery, &style_small, 0);
+  lv_obj_set_pos(ui_battery, 200, 286);
+  lv_label_set_text(ui_battery, "");
 }
 
 // ---------------- UI update ----------------
@@ -484,7 +456,7 @@ static void renderStop(StopUi& ui, const StopConfig& /*cfg*/, const StopArrivals
   // Minutes are recomputed from the cached ISO string on every render
   // so a row keeps counting down between successful fetches.
   int row = 0;
-  for (int i = 0; i < arr.count && row < 4; i++) {
+  for (int i = 0; i < arr.count && row < 3; i++) {
     int m1 = minutesUntil(arr.rows[i].iso1);
     int m2 = minutesUntil(arr.rows[i].iso2);
 
@@ -499,7 +471,7 @@ static void renderStop(StopUi& ui, const StopConfig& /*cfg*/, const StopArrivals
     row++;
   }
   // Hide any leftover rows from a previous render
-  for (; row < 4; row++) {
+  for (; row < 3; row++) {
     lv_label_set_text(ui.svc_label[row],   "");
     lv_label_set_text(ui.next_label[row],  "");
     lv_label_set_text(ui.after_label[row], "");
@@ -508,6 +480,9 @@ static void renderStop(StopUi& ui, const StopConfig& /*cfg*/, const StopArrivals
 }
 
 static void renderAll(const StopArrivals& a, const StopArrivals& b) {
+  // Sample the battery outside the LVGL lock — analogRead is slow-ish.
+  int batt = readBatteryPercent();
+
   if (Lvgl_lock(-1)) {
     renderStop(ui_a, STOP_A, a);
     renderStop(ui_b, STOP_B, b);
@@ -518,6 +493,10 @@ static void renderAll(const StopArrivals& a, const StopArrivals& b) {
       strftime(buf, sizeof(buf), "Updated %H:%M", &tm_now);
       lv_label_set_text(ui_footer, buf);
     }
+
+    char bbuf[8];
+    snprintf(bbuf, sizeof(bbuf), "%d%%", batt);
+    lv_label_set_text(ui_battery, bbuf);
 
     // Status line: blank if both stops fetched cleanly, else show
     // the first error we have.
@@ -547,6 +526,10 @@ static void connectWiFi() {
     Serial.print(".");
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? " connected" : " FAILED");
+
+  // Let the radio doze between beacons. We only talk to the AP once
+  // every ~30 s, so max modem-sleep is safe and saves tens of mA.
+  WiFi.setSleep(WIFI_PS_MAX_MODEM);
 }
 
 // Full WiFi stack reset. Used after repeated fetch failures when
@@ -565,6 +548,22 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\nSG Bus Display");
+
+  // JSON parse + LVGL repaint of a handful of labels every 30 s is
+  // trivial work — 80 MHz is plenty and roughly halves active current
+  // versus the 240 MHz default.
+  setCpuFrequencyMhz(80);
+
+  // Automatic light sleep during FreeRTOS idle. The SoC drops to 10 MHz
+  // (or sleeps outright) between LVGL's 5 ms ticks and during the 30 s
+  // poll gap. Combined with WIFI_PS_MAX_MODEM this lets both CPU and
+  // radio doze whenever there's nothing to do.
+  esp_pm_config_t pm_config = {
+    .max_freq_mhz = 80,
+    .min_freq_mhz = 10,
+    .light_sleep_enable = true,
+  };
+  esp_pm_configure(&pm_config);
 
   // 1. Bring up the panel and LVGL exactly like the Waveshare example.
   RlcdPort.RLCD_Init();
@@ -603,10 +602,10 @@ void loop() {
     arrivals_initialized = true;
   }
 
-  // Stagger the two LTA calls by REFRESH_MS instead of firing them
-  // back-to-back. Each stop is polled once per (2 * REFRESH_MS) but
-  // the UI still repaints every REFRESH_MS — between fetches the
-  // cached ISO timestamps keep counting down.
+  // Poll both stops back-to-back in one WiFi wake window, then idle for
+  // REFRESH_MS. Keeping the radio active for one longer burst (instead
+  // of two separate bursts staggered by REFRESH_MS) lets it stay in
+  // deeper modem-sleep across the gap.
   //
   // After 3 consecutive failed fetches we assume WiFi.status() is
   // lying (zombie association) and force a full stack reset. A plain
@@ -624,9 +623,6 @@ void loop() {
   };
 
   pollOne(STOP_A, a);
-  renderAll(a, b);
-  vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
-
   pollOne(STOP_B, b);
   renderAll(a, b);
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
