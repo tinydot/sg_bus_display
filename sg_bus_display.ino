@@ -112,7 +112,14 @@ static void Lvgl_FlushCallback(lv_display_t* drv, const lv_area_t* area, uint8_t
 static StopUi ui_a;
 static StopUi ui_b;
 static lv_obj_t* ui_footer;
-static lv_obj_t* ui_status; // shown only when something is wrong
+static lv_obj_t* ui_status;  // shown only when something is wrong
+static lv_obj_t* ui_battery; // "NN%" battery indicator
+
+// Waveshare ESP32-S3-RLCD-4.2 routes VBAT through a 3x divider into
+// GPIO4 (ADC1 ch3). 18650 cell: 2.5 V empty -> 4.2 V full.
+static const int BAT_ADC_PIN = 4;
+static const uint32_t BAT_EMPTY_MV = 2500;
+static const uint32_t BAT_FULL_MV  = 4200;
 
 static lv_style_t style_header;
 static lv_style_t style_row;
@@ -290,6 +297,20 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   return true;
 }
 
+// ---------------- Battery ----------------
+
+static int readBatteryPercent() {
+  // Average 16 reads; analogReadMilliVolts applies the ESP32-S3's
+  // factory ADC calibration so we don't have to hand-tune.
+  const int samples = 16;
+  uint32_t sum_mv = 0;
+  for (int i = 0; i < samples; i++) sum_mv += analogReadMilliVolts(BAT_ADC_PIN);
+  uint32_t mv = (sum_mv / samples) * 3;  // undo the 3x divider
+  if (mv <= BAT_EMPTY_MV) return 0;
+  if (mv >= BAT_FULL_MV)  return 100;
+  return (int)((mv - BAT_EMPTY_MV) * 100 / (BAT_FULL_MV - BAT_EMPTY_MV));
+}
+
 // ---------------- UI build ----------------
 
 static void formatMin(int m, char* buf, size_t n) {
@@ -420,6 +441,12 @@ static void buildUi() {
   lv_obj_add_style(ui_status, &style_small, 0);
   lv_obj_set_pos(ui_status, 6, 286);
   lv_label_set_text(ui_status, "Booting...");
+
+  // Battery indicator, centered between status and footer.
+  ui_battery = lv_label_create(scr);
+  lv_obj_add_style(ui_battery, &style_small, 0);
+  lv_obj_set_pos(ui_battery, 200, 286);
+  lv_label_set_text(ui_battery, "");
 }
 
 // ---------------- UI update ----------------
@@ -453,6 +480,9 @@ static void renderStop(StopUi& ui, const StopConfig& /*cfg*/, const StopArrivals
 }
 
 static void renderAll(const StopArrivals& a, const StopArrivals& b) {
+  // Sample the battery outside the LVGL lock — analogRead is slow-ish.
+  int batt = readBatteryPercent();
+
   if (Lvgl_lock(-1)) {
     renderStop(ui_a, STOP_A, a);
     renderStop(ui_b, STOP_B, b);
@@ -463,6 +493,10 @@ static void renderAll(const StopArrivals& a, const StopArrivals& b) {
       strftime(buf, sizeof(buf), "Updated %H:%M", &tm_now);
       lv_label_set_text(ui_footer, buf);
     }
+
+    char bbuf[8];
+    snprintf(bbuf, sizeof(bbuf), "%d%%", batt);
+    lv_label_set_text(ui_battery, bbuf);
 
     // Status line: blank if both stops fetched cleanly, else show
     // the first error we have.
@@ -568,10 +602,10 @@ void loop() {
     arrivals_initialized = true;
   }
 
-  // Stagger the two LTA calls by REFRESH_MS instead of firing them
-  // back-to-back. Each stop is polled once per (2 * REFRESH_MS) but
-  // the UI still repaints every REFRESH_MS — between fetches the
-  // cached ISO timestamps keep counting down.
+  // Poll both stops back-to-back in one WiFi wake window, then idle for
+  // REFRESH_MS. Keeping the radio active for one longer burst (instead
+  // of two separate bursts staggered by REFRESH_MS) lets it stay in
+  // deeper modem-sleep across the gap.
   //
   // After 3 consecutive failed fetches we assume WiFi.status() is
   // lying (zombie association) and force a full stack reset. A plain
@@ -589,9 +623,6 @@ void loop() {
   };
 
   pollOne(STOP_A, a);
-  renderAll(a, b);
-  vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
-
   pollOne(STOP_B, b);
   renderAll(a, b);
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
