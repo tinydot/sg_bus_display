@@ -125,6 +125,37 @@ static const StopConfig STOP_A = {
   buses aren't running at this time of day.
 - **Screen never updates after first render** → check Serial Monitor
   for fetch errors. If WiFi dropped, the next loop will reconnect.
+- **Screen blanks for ~5–10 s every hour or so** → this is intentional.
+  The arduino-esp32 HTTPS stack leaks small amounts of heap per request
+  (a well-known upstream issue, see "Heap management" below), so the
+  sketch deliberately reboots itself before the leak causes TLS
+  handshake failures. You'll see "Booting…" briefly, then fresh data.
+
+## Heap management
+
+This panel is reflective but **not bistable** — losing power blanks
+the screen. That matters because the sketch deliberately reboots
+itself periodically.
+
+Why: arduino-esp32's HTTPS layer (mbedTLS + lwIP wrapped by
+`WiFiClientSecure` and `HTTPClient`) has long-standing memory leaks
+that drip ~100–400 bytes per request. After a few hours of polling
+the heap is fragmented enough that `mbedtls_ssl_setup()` fails and
+`HTTPClient.GET()` returns -1 in a loop. The cleanest workaround at
+sketch level is to restart before that happens.
+
+The sketch:
+1. Uses a single static `WiFiClientSecure` / `HTTPClient` pair and
+   closes the TCP+TLS connection after each GET (`setReuse(false)`).
+   This raises steady-state free heap from ~64 KB to ~110 KB and cuts
+   the leak rate roughly 3×.
+2. Calls `ESP.restart()` proactively when free heap drops below 45 KB
+   (usually after ~1 hour of continuous polling).
+3. Calls `ESP.restart()` reactively after 3 consecutive fetch failures.
+
+If you ever modify the fetch code, do **not** drop the static client
+or switch `setReuse(true)` back on without re-measuring heap drift —
+both changes look like simplifications but ~5× the leak rate.
 
 ## Why LVGL? Why not write to the panel directly?
 

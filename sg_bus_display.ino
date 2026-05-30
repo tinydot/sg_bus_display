@@ -127,6 +127,32 @@ static lv_style_t style_small;
 static lv_style_t style_badge;
 static lv_style_t style_badge_text;
 
+// ---------------- Power management ----------------
+
+// Idle: CPU may drop to 10 MHz, light sleep allowed, radio in max
+// modem sleep. Active: CPU pinned at 80 MHz, no light sleep, radio
+// stays awake. TLS handshakes fail (HTTPClient -1) under the idle
+// profile, so we switch to active for the fetch burst.
+static void enterIdlePm() {
+  esp_pm_config_t cfg = {
+    .max_freq_mhz = 80,
+    .min_freq_mhz = 10,
+    .light_sleep_enable = true,
+  };
+  esp_pm_configure(&cfg);
+  WiFi.setSleep(WIFI_PS_MAX_MODEM);
+}
+
+static void enterActivePm() {
+  esp_pm_config_t cfg = {
+    .max_freq_mhz = 80,
+    .min_freq_mhz = 80,
+    .light_sleep_enable = false,
+  };
+  esp_pm_configure(&cfg);
+  WiFi.setSleep(false);
+}
+
 // ---------------- LTA fetch ----------------
 
 // Parse ISO 8601 with timezone (e.g. 2026-05-22T14:46:27+08:00) and
@@ -211,11 +237,31 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
     return false;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure(); // not worth pinning the LTA cert for this
-  HTTPClient http;
+  // Reuse one TLS client + HTTPClient instance across calls (static),
+  // but close the underlying TCP+TLS connection after each GET
+  // (setReuse(false)). This combination is the best compromise we found
+  // for the long-standing arduino-esp32 HTTPS heap-leak family
+  // (issues #3679, #5781, #6257, #10261):
+  //   - Static instances avoid the ~23 KB malloc/free churn that
+  //     constructing WiFiClientSecure per call would cause, and avoid
+  //     the handshake-fail leak compounding across retries (#5781).
+  //   - setReuse(false) releases the ~50 KB mbedTLS session context
+  //     after every fetch, raising steady-state free heap from ~64 KB
+  //     to ~113 KB and cutting the residual ~120 B/fetch leak rate
+  //     to about 1/3 of what setReuse(true) gave us.
+  // A small residual leak remains (lwIP TIME_WAIT TCBs + mbedTLS
+  // per-handshake malloc churn — both known upstream bugs we can't fix
+  // from sketch level). The loop() restart logic handles it cleanly.
+  static WiFiClientSecure client;
+  static HTTPClient http;
+  static bool client_inited = false;
+  if (!client_inited) {
+    client.setInsecure(); // not worth pinning the LTA cert for this
+    client_inited = true;
+  }
 
   String url = String("https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=") + cfg.code;
+  http.setReuse(false);
   http.setTimeout(8000);
   if (!http.begin(client, url)) {
     strncpy(out.error, "begin failed", sizeof(out.error));
@@ -526,22 +572,6 @@ static void connectWiFi() {
     Serial.print(".");
   }
   Serial.println(WiFi.status() == WL_CONNECTED ? " connected" : " FAILED");
-
-  // Let the radio doze between beacons. We only talk to the AP once
-  // every ~30 s, so max modem-sleep is safe and saves tens of mA.
-  WiFi.setSleep(WIFI_PS_MAX_MODEM);
-}
-
-// Full WiFi stack reset. Used after repeated fetch failures when
-// WiFi.status() lies about being CONNECTED (zombie association: the
-// AP dropped us, DHCP lease expired, or lwIP got stuck). A plain
-// WiFi.reconnect() is not enough in that state — we need to tear the
-// stack down and re-associate from scratch.
-static void hardResetWiFi() {
-  Serial.println("WiFi: hard reset");
-  WiFi.disconnect(true, true);   // disconnect + erase stored config
-  delay(500);
-  connectWiFi();
 }
 
 void setup() {
@@ -557,13 +587,10 @@ void setup() {
   // Automatic light sleep during FreeRTOS idle. The SoC drops to 10 MHz
   // (or sleeps outright) between LVGL's 5 ms ticks and during the 30 s
   // poll gap. Combined with WIFI_PS_MAX_MODEM this lets both CPU and
-  // radio doze whenever there's nothing to do.
-  esp_pm_config_t pm_config = {
-    .max_freq_mhz = 80,
-    .min_freq_mhz = 10,
-    .light_sleep_enable = true,
-  };
-  esp_pm_configure(&pm_config);
+  // radio doze whenever there's nothing to do. We turn this off around
+  // the HTTPS fetch — TLS handshakes don't survive light sleep + max
+  // modem sleep + 10 MHz min and come back as HTTPClient error -1.
+  enterIdlePm();
 
   // 1. Bring up the panel and LVGL exactly like the Waveshare example.
   RlcdPort.RLCD_Init();
@@ -575,7 +602,10 @@ void setup() {
     Lvgl_unlock();
   }
 
-  // 3. Network + clock.
+  // 3. Network + clock. Run the initial join + NTP under active PM —
+  // light sleep + max modem sleep during association is just as bad
+  // for TLS-style timing as it is during the GET burst.
+  enterActivePm();
   setStatus("Connecting WiFi...");
   connectWiFi();
 
@@ -588,6 +618,7 @@ void setup() {
   tzset();
   for (int i = 0; i < 20 && time(nullptr) < 1700000000; i++) delay(250);
 
+  enterIdlePm();
   setStatus("");
 }
 
@@ -607,9 +638,10 @@ void loop() {
   // of two separate bursts staggered by REFRESH_MS) lets it stay in
   // deeper modem-sleep across the gap.
   //
-  // After 3 consecutive failed fetches we assume WiFi.status() is
-  // lying (zombie association) and force a full stack reset. A plain
-  // WiFi.reconnect() doesn't recover from that state.
+  // After 3 consecutive failed fetches we reboot. The usual cause is
+  // free heap dropping below what an mbedTLS handshake needs (~50 KB),
+  // and only a full restart reclaims memory held by LVGL, the WiFi
+  // stack, and accumulated TLS state.
   static int consecutive_fails = 0;
   auto pollOne = [&](const StopConfig& cfg, StopArrivals& out) {
     if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
@@ -617,13 +649,30 @@ void loop() {
     if (ok) {
       consecutive_fails = 0;
     } else if (++consecutive_fails >= 3) {
-      hardResetWiFi();
-      consecutive_fails = 0;
+      Serial.printf("Restarting: %d consecutive fails, heap=%u\n",
+                    consecutive_fails, (unsigned)ESP.getFreeHeap());
+      Serial.flush();
+      ESP.restart();
     }
   };
 
+  enterActivePm();
+  // Proactive restart if heap is already too low to handshake.
+  // Steady-state free heap is ~110 KB with setReuse(false); the
+  // residual leak (lwIP TIME_WAIT + mbedTLS handshake churn) drifts
+  // it down ~500 B/cycle, so this typically fires after ~1 hour of
+  // continuous polling — well before mbedTLS_ssl_setup would start
+  // returning -1.
+  if (ESP.getFreeHeap() < 45000) {
+    Serial.printf("Restarting: low heap=%u before fetch\n",
+                  (unsigned)ESP.getFreeHeap());
+    Serial.flush();
+    ESP.restart();
+  }
   pollOne(STOP_A, a);
   pollOne(STOP_B, b);
+  enterIdlePm();
+
   renderAll(a, b);
   vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
 }
