@@ -16,9 +16,10 @@
  *    repo. The display_bsp.h and lvgl_bsp.h headers come from the
  *    Waveshare example's local src/ folder, so we copy them in.
  *    See the README for the copy steps.
- *  - Refresh interval is 30s. The ST7305 isn't designed for fast
- *    repaints and LTA arrival data doesn't change faster than that
- *    anyway.
+ *  - Refresh interval is adaptive: 30s when a bus is due soon, 90s
+ *    when nothing is close, 5 min overnight. The ST7305 isn't designed
+ *    for fast repaints and LTA arrival data doesn't change faster than
+ *    that anyway.
  */
 
 #include <Arduino.h>
@@ -85,8 +86,21 @@ static const StopConfig STOP_B = {
   { "811", nullptr }
 };
 
-// How often to refresh arrivals, in milliseconds.
-static const uint32_t REFRESH_MS = 30UL * 1000UL;
+// How often to refresh arrivals, in milliseconds. The base interval is
+// used when a tracked bus is due soon (or we have no data yet); polling
+// stretches out when nothing is close, and drops right down overnight
+// when these services don't run. See nextRefreshMs().
+static const uint32_t REFRESH_MS       = 30UL * 1000UL;        // bus within threshold / no data
+static const uint32_t REFRESH_SLOW_MS  = 90UL * 1000UL;        // nothing due soon
+static const uint32_t REFRESH_QUIET_MS = 5UL * 60UL * 1000UL;  // overnight quiet hours
+
+// A bus closer than this (minutes) keeps us on the fast interval.
+static const int SLOW_THRESHOLD_MIN = 10;
+
+// Quiet hours in local SGT, minutes since midnight. Services 801/803/
+// 811/861 don't run roughly 00:30-05:30.
+static const int QUIET_START_MIN = 0 * 60 + 30;  // 00:30
+static const int QUIET_END_MIN   = 5 * 60 + 30;  // 05:30
 
 // ---------------- Display port (matches Waveshare example) ----------------
 // Pins from Waveshare's 08_LVGL_V8_Test: SCK=12, MOSI=11, CS=5, DC=40, RST=41
@@ -133,13 +147,30 @@ static lv_style_t style_badge_text;
 // modem sleep. Active: CPU pinned at 80 MHz, no light sleep, radio
 // stays awake. TLS handshakes fail (HTTPClient -1) under the idle
 // profile, so we switch to active for the fetch burst.
+// esp_pm_configure() silently does nothing useful if the Arduino core was
+// built without CONFIG_PM_ENABLE / CONFIG_FREERTOS_USE_TICKLESS_IDLE — it
+// returns ESP_ERR_NOT_SUPPORTED (or ESP_ERR_INVALID_ARG for the
+// light_sleep_enable flag). Track and log that once so a non-working idle
+// profile is visible in the boot log instead of just draining the battery.
+static bool pm_supported = true;
+
+static void applyPmConfig(const esp_pm_config_t& cfg) {
+  esp_err_t err = esp_pm_configure(&cfg);
+  if (err != ESP_OK && pm_supported) {
+    pm_supported = false;
+    Serial.printf("esp_pm_configure failed: %s — automatic light sleep is "
+                  "NOT active (core built without CONFIG_PM_ENABLE / "
+                  "tickless idle)\n", esp_err_to_name(err));
+  }
+}
+
 static void enterIdlePm() {
   esp_pm_config_t cfg = {
     .max_freq_mhz = 80,
     .min_freq_mhz = 10,
     .light_sleep_enable = true,
   };
-  esp_pm_configure(&cfg);
+  applyPmConfig(cfg);
   WiFi.setSleep(WIFI_PS_MAX_MODEM);
 }
 
@@ -149,7 +180,7 @@ static void enterActivePm() {
     .min_freq_mhz = 80,
     .light_sleep_enable = false,
   };
-  esp_pm_configure(&cfg);
+  applyPmConfig(cfg);
   WiFi.setSleep(false);
 }
 
@@ -341,6 +372,37 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
 
   out.ok = true;
   return true;
+}
+
+// ---------------- Adaptive refresh interval ----------------
+
+// Soonest known arrival (minutes) across all tracked services of one
+// stop, or -1 if nothing is known.
+static int soonestMinutes(const StopArrivals& s) {
+  int best = -1;
+  for (int i = 0; i < s.count; i++) {
+    int m = minutesUntil(s.rows[i].iso1);
+    if (m >= 0 && (best < 0 || m < best)) best = m;
+  }
+  return best;
+}
+
+// Pick the next poll interval:
+//  - quiet hours (no service overnight): REFRESH_QUIET_MS
+//  - soonest tracked bus further than SLOW_THRESHOLD_MIN: REFRESH_SLOW_MS
+//  - bus due soon, or no data (boot / fetch failures): REFRESH_MS
+static uint32_t nextRefreshMs(const StopArrivals& a, const StopArrivals& b) {
+  struct tm tm_now;
+  if (getLocalTime(&tm_now, 5)) {
+    int mins = tm_now.tm_hour * 60 + tm_now.tm_min;
+    if (mins >= QUIET_START_MIN && mins < QUIET_END_MIN) return REFRESH_QUIET_MS;
+  }
+
+  int sa = soonestMinutes(a);
+  int sb = soonestMinutes(b);
+  int soonest = (sa < 0) ? sb : (sb < 0 ? sa : min(sa, sb));
+  if (soonest > SLOW_THRESHOLD_MIN) return REFRESH_SLOW_MS;
+  return REFRESH_MS;
 }
 
 // ---------------- Battery ----------------
@@ -550,6 +612,9 @@ static void renderAll(const StopArrivals& a, const StopArrivals& b) {
     else if (!b.ok) lv_label_set_text(ui_status, b.error);
     else            lv_label_set_text(ui_status, "");
 
+    // No free-running LVGL task anymore — repaint synchronously while
+    // we still hold the lock.
+    Lvgl_refresh();
     Lvgl_unlock();
   }
 }
@@ -559,6 +624,7 @@ static void renderAll(const StopArrivals& a, const StopArrivals& b) {
 static void setStatus(const char* msg) {
   if (Lvgl_lock(-1)) {
     lv_label_set_text(ui_status, msg);
+    Lvgl_refresh();
     Lvgl_unlock();
   }
 }
@@ -584,21 +650,26 @@ void setup() {
   // versus the 240 MHz default.
   setCpuFrequencyMhz(80);
 
-  // Automatic light sleep during FreeRTOS idle. The SoC drops to 10 MHz
-  // (or sleeps outright) between LVGL's 5 ms ticks and during the 30 s
-  // poll gap. Combined with WIFI_PS_MAX_MODEM this lets both CPU and
+  // Automatic light sleep during FreeRTOS idle. With on-demand LVGL
+  // rendering (no periodic tick timer or LVGL task) the SoC can drop to
+  // 10 MHz or sleep outright for essentially the whole gap between
+  // polls. Combined with WIFI_PS_MAX_MODEM this lets both CPU and
   // radio doze whenever there's nothing to do. We turn this off around
   // the HTTPS fetch — TLS handshakes don't survive light sleep + max
   // modem sleep + 10 MHz min and come back as HTTPClient error -1.
   enterIdlePm();
+  if (pm_supported) {
+    Serial.println("Power management: auto light sleep + DFS active");
+  }
 
   // 1. Bring up the panel and LVGL exactly like the Waveshare example.
   RlcdPort.RLCD_Init();
   Lvgl_PortInit(400, 300, Lvgl_FlushCallback);
 
-  // 2. Build the static UI under the LVGL lock.
+  // 2. Build the static UI under the LVGL lock and paint it once.
   if (Lvgl_lock(-1)) {
     buildUi();
+    Lvgl_refresh();
     Lvgl_unlock();
   }
 
@@ -674,5 +745,19 @@ void loop() {
   enterIdlePm();
 
   renderAll(a, b);
-  vTaskDelay(pdMS_TO_TICKS(REFRESH_MS));
+
+  // Adaptive wait. Sleep in REFRESH_MS chunks and re-render between
+  // chunks (no radio, just recomputing minutes from cached timestamps)
+  // so the countdown keeps ticking during the longer slow/quiet gaps.
+  uint32_t wait_ms = nextRefreshMs(a, b);
+  if (wait_ms != REFRESH_MS) {
+    Serial.printf("Adaptive poll: next fetch in %lu s\n",
+                  (unsigned long)(wait_ms / 1000));
+  }
+  while (wait_ms > 0) {
+    uint32_t chunk = (wait_ms < REFRESH_MS) ? wait_ms : REFRESH_MS;
+    vTaskDelay(pdMS_TO_TICKS(chunk));
+    wait_ms -= chunk;
+    if (wait_ms > 0) renderAll(a, b);
+  }
 }

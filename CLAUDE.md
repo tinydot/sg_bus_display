@@ -26,13 +26,19 @@ There are no automated tests or linters for this project.
 ### Display Pipeline
 LVGL (16-bit color buffer) → `Lvgl_FlushCallback()` (threshold at `0x7fff` → 1-bit mono) → `DisplayPort` → ST7305 SPI panel
 
-### Threading Model
-- `Lvgl_port_task` (FreeRTOS): runs LVGL timer handler every 5ms; uses a mutex (`Lvgl_lock()`/`Lvgl_unlock()`) that must be held when calling any LVGL API from the main loop
-- Main loop: blocks on `vTaskDelay(REFRESH_MS)`, then re-fetches API data and calls `renderStop()`
+### Threading Model & Rendering
+- LVGL rendering is **on-demand**: there is no free-running LVGL task and no periodic `lv_tick_inc` timer (both were removed so the CPU can light-sleep across the poll gap instead of waking every 5 ms). LVGL gets time lazily via `lv_tick_set_cb`.
+- After mutating widgets under the mutex (`Lvgl_lock()`/`Lvgl_unlock()`), call `Lvgl_refresh()` (→ `lv_refr_now()`) *before* unlocking to repaint synchronously. Forgetting this leaves the change invisible — nothing else will ever flush it.
+- This only works because the UI has no animations or input devices; if either is ever added, a periodic `lv_timer_handler()` caller must be reintroduced.
+- Main loop: fetches API data, calls `renderAll()`, then sleeps in ≤30 s `vTaskDelay` chunks for an adaptive interval (re-rendering between chunks so countdowns keep ticking during long gaps).
 
-### User Configuration (`sg_bus_display.ino` lines 68–82)
+### User Configuration (`sg_bus_display.ino`, "User config" section)
 - `STOP_A` / `STOP_B`: bus stop codes and the service numbers to display (up to 6 each)
-- `REFRESH_MS`: polling interval (default 30 seconds)
+- Adaptive polling (`nextRefreshMs()`): `REFRESH_MS` (30 s) when a bus is within `SLOW_THRESHOLD_MIN` (10 min) or no data is cached; `REFRESH_SLOW_MS` (90 s) when nothing is due soon; `REFRESH_QUIET_MS` (5 min) during SGT quiet hours (`QUIET_START_MIN`–`QUIET_END_MIN`, default 00:30–05:30)
+
+### Power Management
+- `enterIdlePm()` / `enterActivePm()` switch between a low-power profile (DFS 10–80 MHz, auto light sleep, `WIFI_PS_MAX_MODEM`) and a full-power profile for the TLS fetch burst (handshakes fail under the idle profile).
+- `applyPmConfig()` checks the `esp_pm_configure()` return value and logs at boot whether automatic light sleep is actually active — `ESP_ERR_NOT_SUPPORTED`/`ESP_ERR_INVALID_ARG` means the Arduino core was built without `CONFIG_PM_ENABLE`/tickless idle and the idle profile is a no-op.
 
 ### API Integration
 - HTTPS GET to `https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival`
