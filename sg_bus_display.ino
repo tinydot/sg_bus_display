@@ -114,6 +114,14 @@ static StopUi ui_b;
 static lv_obj_t* ui_footer;
 static lv_obj_t* ui_status;  // shown only when something is wrong
 static lv_obj_t* ui_battery; // "NN%" battery indicator
+static lv_obj_t* ui_alert;   // MRT disruption banner (top-left); blank when clear
+static lv_obj_t* ui_weather; // weather strip (top-right)
+
+// Cached values rendered into ui_alert / ui_weather. Updated on their
+// own (slower) cadence — we don't want to hammer LTA TrainServiceAlerts
+// or Open-Meteo at the bus-arrival 30 s rate.
+static char g_alert_text[64]   = "";
+static char g_weather_text[24] = "";
 
 // Waveshare ESP32-S3-RLCD-4.2 routes VBAT through a 3x divider into
 // GPIO4 (ADC1 ch3). 18650 cell: 2.5 V empty -> 4.2 V full.
@@ -151,6 +159,47 @@ static void enterActivePm() {
   };
   esp_pm_configure(&cfg);
   WiFi.setSleep(false);
+}
+
+// ---------------- HTTPS plumbing ----------------
+
+// Single TLS client + HTTPClient shared by every endpoint (BusArrival,
+// TrainServiceAlerts, Open-Meteo). Constructing a fresh WiFiClientSecure
+// per call burns ~23 KB malloc/free; reusing one and toggling
+// setReuse(false) on every GET keeps steady-state heap stable. See the
+// long heap-leak note above fetchStop() for why.
+static WiFiClientSecure g_tls;
+static HTTPClient       g_http;
+static bool             g_tls_inited = false;
+
+static int httpGetBody(const char* url, bool send_lta_key,
+                       String& body_out, char* err, size_t err_n) {
+  body_out = "";
+  err[0] = '\0';
+  if (WiFi.status() != WL_CONNECTED) {
+    snprintf(err, err_n, "No WiFi");
+    return -1;
+  }
+  if (!g_tls_inited) {
+    g_tls.setInsecure();   // not worth pinning certs for public data
+    g_tls_inited = true;
+  }
+  g_http.setReuse(false);
+  g_http.setTimeout(8000);
+  if (!g_http.begin(g_tls, url)) {
+    snprintf(err, err_n, "begin failed");
+    return -1;
+  }
+  if (send_lta_key) g_http.addHeader("AccountKey", LTA_ACCOUNT_KEY);
+  g_http.addHeader("accept", "application/json");
+  int code = g_http.GET();
+  if (code == 200) {
+    body_out = g_http.getString();
+  } else {
+    snprintf(err, err_n, "HTTP %d", code);
+  }
+  g_http.end();
+  return code;
 }
 
 // ---------------- LTA fetch ----------------
@@ -232,58 +281,16 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   out.ok = false;
   out.error[0] = '\0';
 
-  if (WiFi.status() != WL_CONNECTED) {
-    strncpy(out.error, "No WiFi", sizeof(out.error));
-    return false;
-  }
-
-  // Reuse one TLS client + HTTPClient instance across calls (static),
-  // but close the underlying TCP+TLS connection after each GET
-  // (setReuse(false)). This combination is the best compromise we found
-  // for the long-standing arduino-esp32 HTTPS heap-leak family
-  // (issues #3679, #5781, #6257, #10261):
-  //   - Static instances avoid the ~23 KB malloc/free churn that
-  //     constructing WiFiClientSecure per call would cause, and avoid
-  //     the handshake-fail leak compounding across retries (#5781).
-  //   - setReuse(false) releases the ~50 KB mbedTLS session context
-  //     after every fetch, raising steady-state free heap from ~64 KB
-  //     to ~113 KB and cutting the residual ~120 B/fetch leak rate
-  //     to about 1/3 of what setReuse(true) gave us.
-  // A small residual leak remains (lwIP TIME_WAIT TCBs + mbedTLS
-  // per-handshake malloc churn — both known upstream bugs we can't fix
-  // from sketch level). The loop() restart logic handles it cleanly.
-  static WiFiClientSecure client;
-  static HTTPClient http;
-  static bool client_inited = false;
-  if (!client_inited) {
-    client.setInsecure(); // not worth pinning the LTA cert for this
-    client_inited = true;
-  }
-
   String url = String("https://datamall2.mytransport.sg/ltaodataservice/v3/BusArrival?BusStopCode=") + cfg.code;
-  http.setReuse(false);
-  http.setTimeout(8000);
-  if (!http.begin(client, url)) {
-    strncpy(out.error, "begin failed", sizeof(out.error));
-    return false;
-  }
-  http.addHeader("AccountKey", LTA_ACCOUNT_KEY);
-  http.addHeader("accept", "application/json");
-
-  int code = http.GET();
+  String payload;
+  int code = httpGetBody(url.c_str(), /*send_lta_key=*/true,
+                         payload, out.error, sizeof(out.error));
   if (code != 200) {
-    snprintf(out.error, sizeof(out.error), "HTTP %d", code);
     Serial.printf("[%s] HTTP %d (fail), rssi=%d, heap=%u\n",
                   cfg.code, code,
                   (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
-    http.end();
     return false;
   }
-
-  // Read response body as a string first. http.getStream() can deliver
-  // chunked-transfer data that ArduinoJson chokes on with "InvalidInput".
-  String payload = http.getString();
-  http.end();
 
   // Trim any leading whitespace just in case.
   int firstBrace = payload.indexOf('{');
@@ -343,6 +350,96 @@ static bool fetchStop(const StopConfig& cfg, StopArrivals& out) {
   return true;
 }
 
+// ---------------- MRT disruption banner ----------------
+
+// Hits LTA's TrainServiceAlerts endpoint. Writes a short banner string
+// into out_buf — empty when service is normal, otherwise something like
+// "MRT: NSL, EWL disrupted". Returns true on a successful poll (even if
+// "normal"), false on network/parse failure so the caller can keep the
+// previously-cached banner instead of clearing it.
+static bool fetchMrtAlerts(char* out_buf, size_t out_n) {
+  String payload;
+  char err[32];
+  int code = httpGetBody(
+    "https://datamall2.mytransport.sg/ltaodataservice/TrainServiceAlerts",
+    /*send_lta_key=*/true, payload, err, sizeof(err));
+  if (code != 200) {
+    Serial.printf("[mrt] HTTP fail: %s, heap=%u\n",
+                  err, (unsigned)ESP.getFreeHeap());
+    return false;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+
+  // Response shape: { "value": [ { "Status": 1|2, "AffectedSegments": [...] } ] }
+  JsonObject v = doc["value"][0];
+  int status = v["Status"] | 1;
+  if (status == 1) {
+    out_buf[0] = '\0';
+    return true;
+  }
+
+  // Disrupted — collect affected line codes (e.g. "NSL", "EWL"). LTA
+  // gives at most a handful; we'll list up to 4 to keep the banner short.
+  char lines[40] = "";
+  int n = 0;
+  for (JsonObject seg : v["AffectedSegments"].as<JsonArray>()) {
+    const char* line = seg["Line"] | "";
+    if (!*line) continue;
+    if (n > 0) strncat(lines, ",", sizeof(lines) - strlen(lines) - 1);
+    strncat(lines, line, sizeof(lines) - strlen(lines) - 1);
+    if (++n >= 4) break;
+  }
+  if (n == 0) snprintf(out_buf, out_n, "MRT disruption");
+  else        snprintf(out_buf, out_n, "MRT: %s disrupted", lines);
+  return true;
+}
+
+// ---------------- Weather strip ----------------
+
+// Open-Meteo: free, no key, HTTPS. Singapore coords. We ask for current
+// temperature and weather_code, and translate the WMO code to a short
+// 3-4 char label that fits the 18 px header. Writes into out_buf like
+// "29C CLR" or "27C RAIN".
+static const char* wmoLabel(int code) {
+  if (code <= 1)               return "CLR";
+  if (code <= 3)               return "CLD";
+  if (code >= 45 && code <= 48) return "FOG";
+  if (code >= 51 && code <= 67) return "RAIN";
+  if (code >= 71 && code <= 77) return "SNOW";
+  if (code >= 80 && code <= 82) return "SHWR";
+  if (code >= 95)              return "STRM";
+  return "";
+}
+
+static bool fetchWeather(char* out_buf, size_t out_n) {
+  String payload;
+  char err[32];
+  // Singapore: 1.35 N, 103.82 E. tz=auto keeps "current" aligned with SGT.
+  int code = httpGetBody(
+    "https://api.open-meteo.com/v1/forecast"
+    "?latitude=1.35&longitude=103.82"
+    "&current=temperature_2m,weather_code"
+    "&timezone=Asia%2FSingapore",
+    /*send_lta_key=*/false, payload, err, sizeof(err));
+  if (code != 200) {
+    Serial.printf("[wx] HTTP fail: %s, heap=%u\n",
+                  err, (unsigned)ESP.getFreeHeap());
+    return false;
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) return false;
+
+  float t  = doc["current"]["temperature_2m"]   | 0.0f;
+  int   wc = doc["current"]["weather_code"]     | -1;
+  const char* lbl = wmoLabel(wc);
+  if (*lbl) snprintf(out_buf, out_n, "%dC %s", (int)(t + 0.5f), lbl);
+  else      snprintf(out_buf, out_n, "%dC", (int)(t + 0.5f));
+  return true;
+}
+
 // ---------------- Battery ----------------
 
 static int readBatteryPercent() {
@@ -380,6 +477,8 @@ static void buildStopBlock(StopUi& ui, const StopConfig& cfg,
 
   // Up to 4 rows per stop. Each row: black badge with bus number,
   // then "next" and "after" minutes right-aligned in their columns.
+  // Stop A's y_offset is 20 (was 0) to leave room for the top
+  // alert+weather strip; Stop B's y_offset is unchanged at 200.
   for (int i = 0; i < 4; i++) {
     int ry = y_offset + 4 + i * 56;
 
@@ -462,8 +561,24 @@ static void buildUi() {
   lv_style_set_text_font(&style_badge_text, &lv_font_montserrat_32);
   lv_style_set_text_color(&style_badge_text, lv_color_white());
 
-  // 75/25 split: Stop A occupies y = 0..223, Stop B occupies y = 225..298.
-  buildStopBlock(ui_a, STOP_A, 0, STOP_A.label);
+  // Top strip (y = 0..18) holds the MRT disruption banner on the left
+  // and the weather summary on the right. Both use the small font.
+  // Stop A starts at y = 20 to clear it; Stop B is unchanged at y = 200.
+  ui_alert = lv_label_create(scr);
+  lv_obj_add_style(ui_alert, &style_small, 0);
+  lv_obj_set_pos(ui_alert, 6, 4);
+  lv_obj_set_width(ui_alert, 280);
+  lv_label_set_long_mode(ui_alert, LV_LABEL_LONG_DOT);
+  lv_label_set_text(ui_alert, "");
+
+  ui_weather = lv_label_create(scr);
+  lv_obj_add_style(ui_weather, &style_small, 0);
+  lv_obj_set_width(ui_weather, 100);
+  lv_obj_set_style_text_align(ui_weather, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_pos(ui_weather, 294, 4);
+  lv_label_set_text(ui_weather, "");
+
+  buildStopBlock(ui_a, STOP_A, 20, STOP_A.label);
   buildStopBlockCompact(ui_b, STOP_B, 200);
 
   // Horizontal divider between stops
@@ -543,6 +658,12 @@ static void renderAll(const StopArrivals& a, const StopArrivals& b) {
     char bbuf[8];
     snprintf(bbuf, sizeof(bbuf), "%d%%", batt);
     lv_label_set_text(ui_battery, bbuf);
+
+    // Top strip — both populated from background fetches that run on
+    // their own slower cadence. Strings are empty until the first
+    // successful poll, which keeps the strip cleanly blank at boot.
+    lv_label_set_text(ui_alert,   g_alert_text);
+    lv_label_set_text(ui_weather, g_weather_text);
 
     // Status line: blank if both stops fetched cleanly, else show
     // the first error we have.
@@ -671,6 +792,18 @@ void loop() {
   }
   pollOne(STOP_A, a);
   pollOne(STOP_B, b);
+
+  // MRT alerts every 4th cycle (~2 min) and weather every 20th cycle
+  // (~10 min). Both share the same HTTPS client as fetchStop and run
+  // inside the active-PM window so handshakes are reliable. Failures
+  // are non-fatal — they don't bump consecutive_fails, since the bus
+  // ETAs are the primary function and we'd rather not reboot just
+  // because Open-Meteo blinked.
+  static uint32_t cycle = 0;
+  if (cycle % 4 == 0)  fetchMrtAlerts(g_alert_text,   sizeof(g_alert_text));
+  if (cycle % 20 == 0) fetchWeather(g_weather_text,   sizeof(g_weather_text));
+  cycle++;
+
   enterIdlePm();
 
   renderAll(a, b);
